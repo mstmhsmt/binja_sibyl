@@ -2,7 +2,7 @@
 	"plugin": {
 		"name": "Binja Sibyl",
 		"type": ["ui", "binaryview"],
-		"api": "python2",
+		"api": "python3",
 		"description": "Sibyl plugin for Binja",
 		"longdescription": "Sibyl is a tool to recognize function names based on their side effects",
 		"license": {
