@@ -8,7 +8,8 @@ import sibyl.abi.arm
 import sibyl.abi.x86
 import sibyl.abi.mips
 import sibyl.config
-from binaryninja import *
+from binaryninja import BackgroundTaskThread, LabelField, ChoiceField, TextLineField
+from binaryninja import log_info, get_form_input, PluginCommand
 import functools
 import miasm.analysis.machine
 
@@ -46,15 +47,15 @@ CC_MAP = {
 
 # Arch mapping [Binja arch] -> Miasm arch
 ARCH_MAP = {
-    'aarch64'  : 'aarch64l',  # TODO: Why doesn't binja have aarch64b and aarch64l?
-    'armv7'    : 'arml',
-    'armv7eb'  : 'armb',
-    'thumb2'   : 'armtl',
-    'thumb2eb' : 'armtb',
-    'mipsel32' : 'mips32l',
-    'mips32'   : 'mips32b',
-    'x86'      : 'x86_32',
-    'x86_64'   : 'x86_64',
+    'aarch64': 'aarch64l',  # TODO: Why doesn't binja have aarch64b and aarch64l?
+    'armv7': 'arml',
+    'armv7eb': 'armb',
+    'thumb2': 'armtl',
+    'thumb2eb': 'armtb',
+    'mipsel32': 'mips32l',
+    'mips32': 'mips32b',
+    'x86': 'x86_32',
+    'x86_64': 'x86_64',
 }
 
 
@@ -80,13 +81,14 @@ class AnalysisThread(BackgroundTaskThread):
     def run(self):
         engine_name = sibyl.config.config.jit_engine
 
-        log_info('[binja_sibyl.AnalysisThread.run] arch={} engine={} base_addr=0x{:08x}'.format(self._arch,
-                                                                                              engine_name,
-                                                                                              self._base_addr))
+        log_info('[binja_sibyl.AnalysisThread.run] arch={} engine={} base_addr=0x{:08x}'
+                 .format(self._arch,
+                         engine_name,
+                         self._base_addr))
 
         for addr, cc in zip(self._funk_addrs, self._funk_ccs):
             # This could be cached based on cc...
-            log_info('[binja_sibyl.AnalysisThread.run] addr=0x{:08x} cc={}'.format(addr, cc))
+            log_info(f'[binja_sibyl.AnalysisThread.run] addr=0x{addr:08x} cc={cc}')
             tl = sibyl.testlauncher.TestLauncher(
                 self._content,
                 machine=miasm.analysis.machine.Machine(self._arch),
@@ -97,7 +99,7 @@ class AnalysisThread(BackgroundTaskThread):
             )
             possible_names = tl.run(addr, timeout_seconds=self._timeout)
 
-            log_info('[binja_sibyl.AnalysisThread.run] 0x{:08x}: {}'.format(addr, possible_names))
+            log_info(f'[binja_sibyl.AnalysisThread.run] 0x{addr:08x}: {possible_names}')
 
             if len(possible_names) > 0:
                 self._callback(addr, possible_names)
@@ -117,39 +119,23 @@ def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1):
     cc_map = CC_MAP[bv.arch.name]
     m_arch = ARCH_MAP[bv.arch.name]
 
+    log_info(f'[binja_sibyl.guess] {bv.arch.name} -> {m_arch}')
+
     funks = list(filter(lambda x: x.calling_convention.name in cc_map, funks))
 
-    log_info('[binja_sibyl.guess] analyzing {} functions with {} tests'.format(len(funks), len(tests)))
+    log_info('[binja_sibyl.guess] analyzing {} functions with {} tests'
+             .format(len(funks), len(tests)))
 
-    func_tbl = {}
-    for f in funks:
-        a = f.start
-        for k, s in bv.sections.items():
-            if s.start <= a < s.end:
-                try:
-                    func_tbl[k].append(f)
-                except KeyError:
-                    func_tbl[k] = [f]
-                break
-
-    for sn, funks in func_tbl.items():
-        log_info('{}: {} functions'.format(sn, len(funks)))
-        sect = bv.sections[sn]
-        content = bv.read(sect.start, len(sect))
-
-        # for f in funks:
-        #     log_info(f'  {f}')
-
+    if len(bv.sections) == 0:
         addrs = [f.start for f in funks]
         ccs = [cc_map[f.calling_convention.name] for f in funks]
-
         callback = functools.partial(rename_function, bv, prefix=prefix, comment=add_comment)
-
         # Create and start the analysis thread
+        log_info(f'[binja_sibyl.guess] filename={bv.file.filename}')
         analysis = AnalysisThread(
             tests,
-            content,
-            sect.start,
+            bv.read(bv.start, bv.length),
+            bv.start,
             m_arch,
             addrs,
             ccs,
@@ -157,6 +143,43 @@ def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1):
             timeout=timeout
         )
         analysis.run()
+    else:
+        func_tbl = {}
+        for f in funks:
+            a = f.start
+            for k, s in bv.sections.items():
+                if s.start <= a < s.end:
+                    try:
+                        func_tbl[k].append(f)
+                    except KeyError:
+                        func_tbl[k] = [f]
+                    break
+
+        for sn, funks in func_tbl.items():
+            log_info('{}: {} functions'.format(sn, len(funks)))
+            sect = bv.sections[sn]
+            content = bv.read(sect.start, len(sect))
+
+            # for f in funks:
+            #     log_info(f'  {f}')
+
+            addrs = [f.start for f in funks]
+            ccs = [cc_map[f.calling_convention.name] for f in funks]
+
+            callback = functools.partial(rename_function, bv, prefix=prefix, comment=add_comment)
+
+            # Create and start the analysis thread
+            analysis = AnalysisThread(
+                tests,
+                content,
+                sect.start,
+                m_arch,
+                addrs,
+                ccs,
+                callback,
+                timeout=timeout
+            )
+            analysis.run()
 
 
 def cmd_run(bv):
@@ -195,7 +218,8 @@ def cmd_run(bv):
 
 
 def cmd_run_on_function(bv, funk):
-    log_info('[binja_sibyl.cmd_run_on_function] {} ({})'.format(funk.name, funk.calling_convention.name))
+    log_info('[binja_sibyl.cmd_run_on_function] {} ({})'
+             .format(funk.name, funk.calling_convention.name))
 
     test_groups = list(sibyl.config.config.available_tests.keys())
 
