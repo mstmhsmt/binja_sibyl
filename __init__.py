@@ -58,6 +58,8 @@ ARCH_MAP = {
     'x86_64': 'x86_64',
 }
 
+ARCHS = list(ARCH_MAP.values())
+
 
 class AnalysisThread(BackgroundTaskThread):
     """
@@ -115,9 +117,10 @@ def rename_function(bv, addr, names, prefix='', comment=True):
         funk.set_comment(addr, 'Sibyl: {}'.format(', '.join(names)))
 
 
-def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1):
+def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1, m_arch=None):
     cc_map = CC_MAP[bv.arch.name]
-    m_arch = ARCH_MAP[bv.arch.name]
+    if m_arch is None:
+        m_arch = ARCH_MAP[bv.arch.name]
 
     log_info(f'[binja_sibyl.guess] {bv.arch.name} -> {m_arch}')
 
@@ -185,14 +188,17 @@ def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1):
 def cmd_run(bv):
     test_groups = list(sibyl.config.config.available_tests.keys())
 
+    m_arch = ARCH_MAP[bv.arch.name]
+
     gui_label_options = LabelField('Options:')
     gui_tests = ChoiceField('Tests:', test_groups)
     gui_prefix = TextLineField('Function prefix:')
     gui_selector = ChoiceField('Function selector:', ('sub_.*', '.*'))
     gui_comment = ChoiceField('Add comment:', ('Yes', 'No'))
+    gui_arch = ChoiceField('Architecture:', ARCHS, default=ARCHS.index(m_arch))
 
     ret = get_form_input(
-        (gui_label_options, gui_tests, gui_prefix, gui_selector, gui_comment),
+        (gui_label_options, gui_tests, gui_prefix, gui_selector, gui_comment, gui_arch),
         'Sibyl'
     )
 
@@ -205,6 +211,7 @@ def cmd_run(bv):
     rename_only_unknowns = gui_selector.choices[gui_selector.result] == 'sub_.*'
     add_comment = gui_comment.choices[gui_comment.result] == 'Yes'
     prefix = gui_prefix.result.strip()
+    m_arch = gui_arch.choices[gui_arch.result]
 
     # Filter
     funks = bv.functions
@@ -214,7 +221,7 @@ def cmd_run(bv):
     log_info('[binja_sibyl.cmd_run] {} functions found'.format(len(funks)))
 
     # Do the magic
-    guess(bv, funks, tests, prefix=prefix, add_comment=add_comment, timeout=1)
+    guess(bv, funks, tests, prefix=prefix, add_comment=add_comment, timeout=1, m_arch=m_arch)
 
 
 def cmd_run_on_function(bv, funk):
@@ -223,13 +230,16 @@ def cmd_run_on_function(bv, funk):
 
     test_groups = list(sibyl.config.config.available_tests.keys())
 
+    m_arch = ARCH_MAP[bv.arch.name]
+
     gui_label_options = LabelField('Options:')
     gui_tests = ChoiceField('Tests:', test_groups)
     gui_prefix = TextLineField('Function prefix:')
     gui_comment = ChoiceField('Add comment:', ('Yes', 'No'))
+    gui_arch = ChoiceField('Architecture:', ARCHS, default=ARCHS.index(m_arch))
 
     ret = get_form_input(
-        (gui_label_options, gui_tests, gui_prefix, gui_comment),
+        (gui_label_options, gui_tests, gui_prefix, gui_comment, gui_arch),
         'Sibyl'
     )
 
@@ -239,8 +249,9 @@ def cmd_run_on_function(bv, funk):
     tests = sibyl.config.config.available_tests[test_groups[gui_tests.result]]
     add_comment = gui_comment.choices[gui_comment.result] == 'Yes'
     prefix = gui_prefix.result.strip()
+    m_arch = gui_arch.choices[gui_arch.result]
 
-    guess(bv, [funk], tests, prefix=prefix, add_comment=add_comment, timeout=5)
+    guess(bv, [funk], tests, prefix=prefix, add_comment=add_comment, timeout=5, m_arch=m_arch)
 
 
 PluginCommand.register(
