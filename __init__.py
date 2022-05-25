@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 
 from __future__ import print_function
+import subprocess
+import tempfile
+import json
+import os
 
 import sibyl.testlauncher
 import sibyl.abi
@@ -11,37 +15,36 @@ import sibyl.config
 from binaryninja import BackgroundTaskThread, LabelField, ChoiceField, TextLineField
 from binaryninja import log_info, get_form_input, PluginCommand
 import functools
-import miasm.analysis.machine
 
 
 # Map calling convention [Binja arch][Binja cc name] -> sibyl cc
 CC_MAP = {
     'armv7': {
-        'cdecl': sibyl.abi.arm.ABI_ARM,
+        'cdecl': 'ABI_ARM',
     },
     'armv7eb': {
-        'cdecl': sibyl.abi.arm.ABI_ARM,
+        'cdecl': 'ABI_ARM',
     },
     'mips32': {
-        'o32': sibyl.abi.mips.ABI_MIPS_O32,
+        'o32': 'ABI_MIPS_O32',
     },
     'mipsel32': {
-        'o32': sibyl.abi.mips.ABI_MIPS_O32,
+        'o32': 'ABI_MIPS_O32',
     },
     'thumb2': {
-        'cdecl': sibyl.abi.arm.ABI_ARM,
+        'cdecl': 'ABI_ARM',
     },
     'thumb2eb': {
-        'cdecl': sibyl.abi.arm.ABI_ARM,
+        'cdecl': 'ABI_ARM',
     },
     'x86': {
-        'cdecl': sibyl.abi.x86.ABIStdCall_x86_32,
-        'fastcall': sibyl.abi.x86.ABIFastCall_x86_32,
-        'stdcall': sibyl.abi.x86.ABIStdCall_x86_32,
+        'cdecl': 'ABIStdCall_x86_32',
+        'fastcall': 'ABIFastCall_x86_32',
+        'stdcall': 'ABIStdCall_x86_32',
     },
     'x86_64': {
-        'sysv': sibyl.abi.x86.ABI_AMD64_SYSTEMV,
-        'win64': sibyl.abi.x86.ABI_AMD64_MS,
+        'sysv': 'ABI_AMD64_SYSTEMV',
+        'win64': 'ABI_AMD64_MS',
     },
 }
 
@@ -57,8 +60,45 @@ ARCH_MAP = {
     'x86': 'x86_32',
     'x86_64': 'x86_64',
 }
-
 ARCHS = list(ARCH_MAP.values())
+
+SIBYL_CMD = 'sibyl'
+
+
+def exec_cmd(cmd):
+    # print(f'!!! cmd={cmd}')
+    out = None
+    p = subprocess.run(cmd, shell=True, close_fds=True, capture_output=True)
+    rc = p.returncode
+    if rc == 0:
+        out = p.stdout
+    # print(f'!!! out={out}')
+    return out
+
+
+def gen_temp_bin(content):
+    h, temp = tempfile.mkstemp(suffix='.bin')
+    os.close(h)
+
+    with open(temp, 'wb') as f:
+        f.write(content)
+
+    return temp
+
+
+def analyze(tests, bin_file, base_addr, arch, addr, abi, engine, timeout=1):
+    _cmd = f'timeout {timeout} {SIBYL_CMD} find -o JSON'
+    opts = f' -a {arch} -b {abi} -t {tests} -i {timeout} -m {base_addr} -j {engine}'
+    cmd = f'{_cmd}{opts} {bin_file} {addr}'
+    r = exec_cmd(cmd)
+    out = None
+    if r:
+        try:
+            d = json.loads(r)
+            out = [(r['address'], r['functions']) for r in d['results']]
+        except Exception:
+            pass
+    return out
 
 
 class AnalysisThread(BackgroundTaskThread):
@@ -69,6 +109,7 @@ class AnalysisThread(BackgroundTaskThread):
     """
 
     def __init__(self, tests, content, base_addr, arch, funk_addrs, funk_ccs, callback, timeout=1):
+
         super(AnalysisThread, self).__init__('Running Sibyl...', True)
 
         self._tests = tests
@@ -88,33 +129,41 @@ class AnalysisThread(BackgroundTaskThread):
                          engine_name,
                          self._base_addr))
 
+        nfunks = len(self._funk_addrs)
+        nfunks_ = float(nfunks)
+
+        bin_file = gen_temp_bin(self._content)
+
+        log_info(f'[binja_sibyl.AnalysisThread.run] bin_file={bin_file}')
+
+        count = 0
+
         for addr, cc in zip(self._funk_addrs, self._funk_ccs):
-            # This could be cached based on cc...
-            log_info(f'[binja_sibyl.AnalysisThread.run] addr=0x{addr:08x} cc={cc}')
-            tl = sibyl.testlauncher.TestLauncher(
-                self._content,
-                machine=miasm.analysis.machine.Machine(self._arch),
-                abicls=cc,
-                tests_cls=self._tests,
-                engine_name=engine_name,
-                map_addr=self._base_addr
-            )
-            possible_names = tl.run(addr, timeout_seconds=self._timeout)
+            if self.cancelled:
+                break
+            count += 1
+            p = float(100 * count) / nfunks_
+            self.progress = f'Sibyl: analyzing 0x{addr:x} ({count}/{nfunks}={p:.2f}%)...'
+            rl = analyze(self._tests, bin_file, self._base_addr, self._arch, addr, cc,
+                         engine_name, timeout=self._timeout)
+            if rl:
+                for a, fl in rl:
+                    if fl:
+                        self._callback(a, fl)
 
-            log_info(f'[binja_sibyl.AnalysisThread.run] 0x{addr:08x}: {possible_names}')
+        self.progress = 'Sibyl: done.'
+        self.finished = True
 
-            if len(possible_names) > 0:
-                self._callback(addr, possible_names)
-
-        self.finish()
+        log_info(f'[binja_sibyl.AnalysisThread.run] analyzed {count} functions')
 
 
 def rename_function(bv, addr, names, prefix='', comment=True):
-    print('sibyl> 0x{:08X}: [{}]'.format(addr, ', '.join(names)))
+    names_str = ', '.join(names)
+    print(f'sibyl> 0x{addr:08x}: [{names_str}]')
     funk = bv.get_function_at(addr)
     funk.name = prefix + names[0]
     if comment:
-        funk.set_comment(addr, 'Sibyl: {}'.format(', '.join(names)))
+        funk.set_comment(addr, f'Sibyl: {names_str}')
 
 
 def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1, m_arch=None):
@@ -125,16 +174,16 @@ def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1, m_arch=Non
     log_info(f'[binja_sibyl.guess] {bv.arch.name} -> {m_arch}')
 
     funks = list(filter(lambda x: x.calling_convention.name in cc_map, funks))
+    nfunks = len(funks)
 
-    log_info('[binja_sibyl.guess] analyzing {} functions with {} tests'
-             .format(len(funks), len(tests)))
+    log_info(f'[binja_sibyl.guess] analyzing {nfunks} functions with {len(tests)} tests')
 
     if len(bv.sections) == 0:
+
         addrs = [f.start for f in funks]
         ccs = [cc_map[f.calling_convention.name] for f in funks]
         callback = functools.partial(rename_function, bv, prefix=prefix, comment=add_comment)
         # Create and start the analysis thread
-        log_info(f'[binja_sibyl.guess] filename={bv.file.filename}')
         analysis = AnalysisThread(
             tests,
             bv.read(bv.start, bv.length),
@@ -143,9 +192,10 @@ def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1, m_arch=Non
             addrs,
             ccs,
             callback,
-            timeout=timeout
+            timeout=timeout,
         )
-        analysis.run()
+        analysis.start()
+
     else:
         func_tbl = {}
         for f in funks:
@@ -159,18 +209,14 @@ def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1, m_arch=Non
                     break
 
         for sn, funks in func_tbl.items():
-            log_info('{}: {} functions'.format(sn, len(funks)))
+            log_info(f'{sn}: {len(funks)} functions')
             sect = bv.sections[sn]
             content = bv.read(sect.start, len(sect))
-
             # for f in funks:
             #     log_info(f'  {f}')
-
             addrs = [f.start for f in funks]
             ccs = [cc_map[f.calling_convention.name] for f in funks]
-
             callback = functools.partial(rename_function, bv, prefix=prefix, comment=add_comment)
-
             # Create and start the analysis thread
             analysis = AnalysisThread(
                 tests,
@@ -180,9 +226,9 @@ def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1, m_arch=Non
                 addrs,
                 ccs,
                 callback,
-                timeout=timeout
+                timeout=timeout,
             )
-            analysis.run()
+            analysis.start()
 
 
 def cmd_run(bv):
@@ -207,7 +253,7 @@ def cmd_run(bv):
         return
 
     # Sanitize options
-    tests = sibyl.config.config.available_tests[test_groups[gui_tests.result]]
+    tests = test_groups[gui_tests.result]
     rename_only_unknowns = gui_selector.choices[gui_selector.result] == 'sub_.*'
     add_comment = gui_comment.choices[gui_comment.result] == 'Yes'
     prefix = gui_prefix.result.strip()
@@ -218,15 +264,14 @@ def cmd_run(bv):
     if rename_only_unknowns:
         funks = list(filter(lambda x: x.name.startswith('sub_'), funks))
 
-    log_info('[binja_sibyl.cmd_run] {} functions found'.format(len(funks)))
+    log_info(f'[binja_sibyl.cmd_run] {len(funks)} functions found')
 
     # Do the magic
     guess(bv, funks, tests, prefix=prefix, add_comment=add_comment, timeout=1, m_arch=m_arch)
 
 
 def cmd_run_on_function(bv, funk):
-    log_info('[binja_sibyl.cmd_run_on_function] {} ({})'
-             .format(funk.name, funk.calling_convention.name))
+    log_info(f'[binja_sibyl.cmd_run_on_function] {funk.name} ({funk.calling_convention.name})')
 
     test_groups = list(sibyl.config.config.available_tests.keys())
 
@@ -246,7 +291,7 @@ def cmd_run_on_function(bv, funk):
     if not ret:
         return
 
-    tests = sibyl.config.config.available_tests[test_groups[gui_tests.result]]
+    tests = test_groups[gui_tests.result]
     add_comment = gui_comment.choices[gui_comment.result] == 'Yes'
     prefix = gui_prefix.result.strip()
     m_arch = gui_arch.choices[gui_arch.result]
@@ -255,13 +300,13 @@ def cmd_run_on_function(bv, funk):
 
 
 PluginCommand.register(
-    name='Run Sybil on whole file',
+    name='Run Sibyl on whole file',
     description='Infer functions\' names from side effects',
     action=cmd_run
 )
 
 PluginCommand.register_for_function(
-    name='Run Sybil on current function',
+    name='Run Sibyl on current function',
     description='Infer function\'s name from its side effects',
     action=cmd_run_on_function
 )
