@@ -13,7 +13,7 @@ import sibyl.abi.x86
 import sibyl.abi.mips
 import sibyl.config
 from binaryninja import BackgroundTaskThread, LabelField, ChoiceField, TextLineField
-from binaryninja import log_info, get_form_input, PluginCommand
+from binaryninja import log_info, log_debug, get_form_input, PluginCommand
 import functools
 
 
@@ -63,6 +63,7 @@ ARCH_MAP = {
 ARCHS = list(ARCH_MAP.values())
 
 SIBYL_CMD = 'sibyl'
+CHUNK_SIZE = 8
 
 
 def exec_cmd(cmd):
@@ -101,6 +102,23 @@ def analyze(tests, bin_file, base_addr, arch, addr, abi, engine, timeout=1):
     return out
 
 
+def analyze_multi(tests, bin_file, base_addr, arch, addrl, abi, engine, timeout=1):
+    timeout_ = timeout + 1
+    addrl_str = ' '.join([str(a) for a in addrl])
+    _cmd = f'timeout {timeout_} {SIBYL_CMD} find -o JSON'
+    opts = f' -a {arch} -b {abi} -t {tests} -i {timeout} -m {base_addr} -j {engine}'
+    cmd = f'{_cmd}{opts} {bin_file} {addrl_str}'
+    r = exec_cmd(cmd)
+    out = None
+    if r:
+        try:
+            d = json.loads(r)
+            out = [(r['address'], r['functions']) for r in d['results']]
+        except Exception:
+            log_debug(f'failed to analyze {addrl_str}: {r}')
+    return out
+
+
 class AnalysisThread(BackgroundTaskThread):
     """
     Sibyl's IDA plugin uses subprocesses in order to fully exploit multiprocessing.
@@ -108,7 +126,8 @@ class AnalysisThread(BackgroundTaskThread):
     This ways it's way slower though.
     """
 
-    def __init__(self, tests, content, base_addr, arch, funk_addrs, funk_ccs, callback, timeout=1):
+    def __init__(self, tests, content, base_addr, arch, funk_addrs, funk_ccs, callback, timeout=1,
+                 multi=False):
 
         super(AnalysisThread, self).__init__('Running Sibyl...', True)
 
@@ -120,8 +139,11 @@ class AnalysisThread(BackgroundTaskThread):
         self._funk_ccs = funk_ccs
         self._callback = callback
         self._timeout = timeout
+        self._multi = multi
 
     def run(self):
+        chunk_size = CHUNK_SIZE
+
         engine_name = sibyl.config.config.jit_engine
 
         log_info('[binja_sibyl.AnalysisThread.run] arch={} engine={} base_addr=0x{:08x}'
@@ -138,18 +160,50 @@ class AnalysisThread(BackgroundTaskThread):
 
         count = 0
 
-        for addr, cc in zip(self._funk_addrs, self._funk_ccs):
-            if self.cancelled:
-                break
-            count += 1
-            p = float(100 * count) / nfunks_
-            self.progress = f'Sibyl: analyzing 0x{addr:x} ({count}/{nfunks}={p:.2f}%)...'
-            rl = analyze(self._tests, bin_file, self._base_addr, self._arch, addr, cc,
-                         engine_name, timeout=self._timeout)
-            if rl:
-                for a, fl in rl:
-                    if fl:
-                        self._callback(a, fl)
+        if not self._multi:
+            for addr, cc in zip(self._funk_addrs, self._funk_ccs):
+                if self.cancelled:
+                    break
+                count += 1
+                p = float(100 * count) / nfunks_
+                self.progress = f'Sibyl: analyzing 0x{addr:x} ({count}/{nfunks}={p:.2f}%)...'
+                rl = analyze(self._tests, bin_file, self._base_addr, self._arch, addr, cc,
+                             engine_name, timeout=self._timeout)
+                if rl:
+                    for a, fl in rl:
+                        if fl:
+                            self._callback(a, fl)
+        else:
+            tbl = {}
+            for addr, cc in zip(self._funk_addrs, self._funk_ccs):
+                try:
+                    chunkl = tbl[cc]
+                    chunk = chunkl[-1]
+                    if len(chunk) < chunk_size:
+                        chunk.append(addr)
+                    else:
+                        chunkl.append([addr])
+                except KeyError:
+                    tbl[cc] = [[addr]]
+
+            for cc, chunkl in tbl.items():
+                for chunk in chunkl:
+                    if self.cancelled:
+                        break
+
+                    c = len(chunk)
+                    count += c
+                    p = float(100 * count) / nfunks_
+                    a = chunk[0]
+                    self.progress = (f'Sibyl: analyzing {c} function(s) (0x{a:x},...)'
+                                     f' ({count}/{nfunks}={p:.2f}%)...')
+
+                    rl = analyze_multi(self._tests, bin_file, self._base_addr, self._arch, chunk,
+                                       cc, engine_name, timeout=self._timeout)
+                    if rl:
+                        for a, fl in rl:
+                            if fl:
+                                self._callback(a, fl)
 
         self.progress = 'Sibyl: done.'
         self.finished = True
@@ -166,7 +220,7 @@ def rename_function(bv, addr, names, prefix='', comment=True):
         funk.set_comment(addr, f'Sibyl: {names_str}')
 
 
-def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1, m_arch=None):
+def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1, m_arch=None, multi=False):
     cc_map = CC_MAP[bv.arch.name]
     if m_arch is None:
         m_arch = ARCH_MAP[bv.arch.name]
@@ -193,6 +247,7 @@ def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1, m_arch=Non
             ccs,
             callback,
             timeout=timeout,
+            multi=multi,
         )
         analysis.start()
 
@@ -227,6 +282,7 @@ def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1, m_arch=Non
                 ccs,
                 callback,
                 timeout=timeout,
+                multi=multi,
             )
             analysis.start()
 
@@ -267,7 +323,8 @@ def cmd_run(bv):
     log_info(f'[binja_sibyl.cmd_run] {len(funks)} functions found')
 
     # Do the magic
-    guess(bv, funks, tests, prefix=prefix, add_comment=add_comment, timeout=1, m_arch=m_arch)
+    guess(bv, funks, tests, prefix=prefix, add_comment=add_comment, timeout=2, m_arch=m_arch,
+          multi=True)
 
 
 def cmd_run_on_function(bv, funk):
