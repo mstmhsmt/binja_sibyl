@@ -237,6 +237,10 @@ class AnalysisThread(BackgroundTaskThread):
 
         log_info(f'analyzed {count} functions', logger=logger)
 
+        if os.path.exists(bin_file):
+            os.unlink(bin_file)
+            log_info(f'{bin_file} removed', logger=logger)
+
 
 def rename_function(bv, addr, names, prefix='', comment=True):
     names_str = ', '.join(names)
