@@ -84,7 +84,7 @@ CHUNK_SIZE = 8
 
 
 def exec_cmd(cmd):
-    logger = 'exec_cmd'
+    logger = 'binja_sibyl.exec_cmd'
     log_debug(f'cmd="{cmd}"', logger=logger)
     out = None
     p = subprocess.run(cmd, shell=True, close_fds=True, capture_output=True)
@@ -115,35 +115,62 @@ def get_sibyl_command():
     return Settings().get_string("binja_sibyl.sibyl_command_path")
 
 
-def analyze(tests, bin_file, base_addr, arch, addr, abi, engine, timeout=1):
-    _cmd = f'{get_timeout_command()} {timeout} {get_sibyl_command()} find -o JSON'
+def get_base_addr(addr):
+    a = addr if addr % 0x1000 == 0 else 0
+    o = a - addr
+    return a, o
+
+
+def analyze(tests, bin_file, base_addr, arch, addr, abi, engine, timeout=3, sibyl_timeout=2):
+    logger = 'binja_sibyl.analyze'
+
+    base_addr, ofs = get_base_addr(base_addr)
+    _addr = addr
+    if ofs != 0:
+        log_debug(f'base address changed to {base_addr:#x} (offset={ofs:+#x})', logger=logger)
+        addr = addr + ofs
+
+    _cmd = f'{get_timeout_command()} {timeout+1} {get_sibyl_command()} find -o JSON'
     opts = f' -a {arch} -b {abi} -t {tests} -i {timeout} -m {base_addr} -j {engine}'
     cmd = f'{_cmd}{opts} {bin_file} {addr}'
     r = exec_cmd(cmd)
+
     out = None
     if r:
         try:
             d = json.loads(r)
-            out = [(r['address'], r['functions']) for r in d['results']]
+            out = [(r['address'] - ofs, r['functions']) for r in d['results']]
         except Exception:
-            pass
+            log_error(f'failed to analyze {_addr}: {r}', logger=logger)
+
     return out
 
 
-def analyze_multi(tests, bin_file, base_addr, arch, addrl, abi, engine, timeout=1):
-    timeout_ = timeout + 1
+def analyze_multi(tests, bin_file, base_addr, arch, addrl, abi, engine, timeout=3,
+                  sibyl_timeout=2):
+    logger = 'binja_sibyl.analyze_multi'
+
+    base_addr, ofs = get_base_addr(base_addr)
+    _addrl = addrl
+    if ofs != 0:
+        log_debug(f'base address changed to {base_addr:#x} (offset={ofs:+#x})', logger=logger)
+        addrl = list(map(lambda a: a + ofs, addrl))
+
     addrl_str = ' '.join([str(a) for a in addrl])
-    _cmd = f'{get_timeout_command()} {timeout_} {get_sibyl_command()} find -o JSON'
-    opts = f' -a {arch} -b {abi} -t {tests} -i {timeout} -m {base_addr} -j {engine}'
+    _cmd = f'{get_timeout_command()} {timeout} {get_sibyl_command()} find -o JSON'
+    opts = f' -a {arch} -b {abi} -t {tests} -i {sibyl_timeout} -m {base_addr} -j {engine}'
     cmd = f'{_cmd}{opts} {bin_file} {addrl_str}'
     r = exec_cmd(cmd)
+
     out = None
     if r:
         try:
             d = json.loads(r)
-            out = [(r['address'], r['functions']) for r in d['results']]
+            out = [(r['address'] - ofs, r['functions']) for r in d['results']]
         except Exception:
-            log_error(f'failed to analyze {addrl_str}: {r}', logger='analyze_multi')
+            log_error(f'failed to analyze {" ".join([str(a) for a in _addrl])}: {r}',
+                      logger=logger)
+
     return out
 
 
@@ -154,7 +181,10 @@ class AnalysisThread(BackgroundTaskThread):
     This ways it's way slower though.
     """
 
-    def __init__(self, tests, content, base_addr, arch, funk_addrs, funk_ccs, callback, timeout=1,
+    logger = 'binja_sibyl.AnalysisThread'
+
+    def __init__(self, tests, content, base_addr, arch, funk_addrs, funk_ccs, callback,
+                 timeout=3, sibyl_timeout=2,
                  multi=False):
 
         super(AnalysisThread, self).__init__('Running Sibyl...', True)
@@ -167,19 +197,26 @@ class AnalysisThread(BackgroundTaskThread):
         self._funk_ccs = funk_ccs
         self._callback = callback
         self._timeout = timeout
+        self._sibyl_timeout = sibyl_timeout
         self._multi = multi
 
     def run(self):
-        logger = 'binja_sibyl.AnalysisThread.run'
+        logger = self.logger + '.run'
+
         chunk_size = CHUNK_SIZE
 
         engine_name = sibyl.config.config.jit_engine
 
-        log_info(f'arch={self._arch} engine={engine_name} base_addr=0x{self._base_addr:08x}',
+        log_info(f'arch={self._arch} engine={engine_name} base_addr={self._base_addr:#08x}',
                  logger=logger)
 
         nfunks = len(self._funk_addrs)
         nfunks_ = float(nfunks)
+
+        if nfunks == 0:
+            return
+
+        log_info(f'running on {self._funk_addrs[0]:#x}...', logger=logger)
 
         bin_file = gen_temp_bin(self._content)
 
@@ -187,20 +224,7 @@ class AnalysisThread(BackgroundTaskThread):
 
         count = 0
 
-        if not self._multi:
-            for addr, cc in zip(self._funk_addrs, self._funk_ccs):
-                if self.cancelled:
-                    break
-                count += 1
-                p = float(100 * count) / nfunks_
-                self.progress = f'Sibyl: analyzing 0x{addr:x} ({count}/{nfunks}={p:.2f}%)...'
-                rl = analyze(self._tests, bin_file, self._base_addr, self._arch, addr, cc,
-                             engine_name, timeout=self._timeout)
-                if rl:
-                    for a, fl in rl:
-                        if fl:
-                            self._callback(a, fl)
-        else:
+        if self._multi:
             tbl = {}
             for addr, cc in zip(self._funk_addrs, self._funk_ccs):
                 try:
@@ -222,63 +246,87 @@ class AnalysisThread(BackgroundTaskThread):
                     count += c
                     p = float(100 * count) / nfunks_
                     a = chunk[0]
-                    self.progress = (f'Sibyl: analyzing {c} function(s) (0x{a:x},...)'
+                    self.progress = (f'Sibyl: analyzing {c} function(s) ({a:#x},...)'
                                      f' ({count}/{nfunks}={p:.2f}%)...')
 
                     rl = analyze_multi(self._tests, bin_file, self._base_addr, self._arch, chunk,
-                                       cc, engine_name, timeout=self._timeout)
+                                       cc, engine_name,
+                                       timeout=self._timeout, sibyl_timeout=self._sibyl_timeout)
                     if rl:
                         for a, fl in rl:
                             if fl:
                                 self._callback(a, fl)
+        else:
+            for addr, cc in zip(self._funk_addrs, self._funk_ccs):
+                if self.cancelled:
+                    break
+                count += 1
+                p = float(100 * count) / nfunks_
+                self.progress = f'Sibyl: analyzing {addr:#x} ({count}/{nfunks}={p:.2f}%)...'
+                rl = analyze(self._tests, bin_file, self._base_addr, self._arch,
+                             addr, cc, engine_name,
+                             timeout=self._timeout, sibyl_timeout=self._sibyl_timeout)
+                if rl:
+                    for a, fl in rl:
+                        if fl:
+                            self._callback(a, fl)
 
         self.progress = 'Sibyl: done.'
         self.finished = True
 
-        log_info(f'analyzed {count} functions', logger=logger)
+        log_info(f'analyzed {count} function(s): {self._funk_addrs[0]:#x}...', logger=logger)
 
         if os.path.exists(bin_file):
             os.unlink(bin_file)
-            log_info(f'{bin_file} removed', logger=logger)
+            log_debug(f'{bin_file} removed', logger=logger)
 
 
 def rename_function(bv, addr, names, prefix='', comment=True):
+    logger = 'binja_sibyl.rename_function'
     names_str = ', '.join(names)
-    print(f'sibyl> 0x{addr:08x}: [{names_str}]')
+    log_info(f'{addr:#08x} -> [{names_str}]', logger=logger)
     funk = bv.get_function_at(addr)
     funk.name = prefix + names[0]
     if comment:
         funk.set_comment(addr, f'Sibyl: {names_str}')
 
 
-def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1, m_arch=None, multi=False):
+def guess(bv, funks, tests_name,
+          prefix='s_', add_comment=True, timeout=2, m_arch=None, multi=False):
     logger = 'binja_sibyl.guess'
+
     cc_map = CC_MAP[bv.arch.name]
     if m_arch is None:
         m_arch = ARCH_MAP[bv.arch.name]
 
     log_info(f'{bv.arch.name} -> {m_arch}', logger=logger)
 
+    ntests = len(sibyl.config.config.available_tests[tests_name])
+
     funks = list(filter(lambda x: x.calling_convention.name in cc_map, funks))
     nfunks = len(funks)
 
-    log_info(f'analyzing {nfunks} functions with {len(tests)} tests', logger=logger)
+    log_info(f'analyzing {nfunks} functions with {ntests} tests', logger=logger)
 
     if len(bv.sections) == 0:
 
         addrs = [f.start for f in funks]
         ccs = [cc_map[f.calling_convention.name] for f in funks]
         callback = functools.partial(rename_function, bv, prefix=prefix, comment=add_comment)
+
+        bv_start = bv.start
+
         # Create and start the analysis thread
         analysis = AnalysisThread(
-            tests,
-            bv.read(bv.start, bv.length),
-            bv.start,
+            tests_name,
+            bv.read(bv_start, bv.length),
+            bv_start,
             m_arch,
             addrs,
             ccs,
             callback,
-            timeout=timeout,
+            timeout=timeout + 1,
+            sibyl_timeout=timeout,
             multi=multi,
         )
         analysis.start()
@@ -298,22 +346,25 @@ def guess(bv, funks, tests, prefix='s_', add_comment=True, timeout=1, m_arch=Non
         for sn, funks in func_tbl.items():
             log_info(f'{sn}: {len(funks)} functions', logger=logger)
             sect = bv.sections[sn]
-            content = bv.read(sect.start, len(sect))
+            sect_start = sect.start
+            content = bv.read(sect_start, len(sect))
             # for f in funks:
             #     log_info(f'  {f}')
             addrs = [f.start for f in funks]
             ccs = [cc_map[f.calling_convention.name] for f in funks]
             callback = functools.partial(rename_function, bv, prefix=prefix, comment=add_comment)
+
             # Create and start the analysis thread
             analysis = AnalysisThread(
-                tests,
+                tests_name,
                 content,
-                sect.start,
+                sect_start,
                 m_arch,
                 addrs,
                 ccs,
                 callback,
-                timeout=timeout,
+                timeout=timeout + 1,
+                sibyl_timeout=timeout,
                 multi=multi,
             )
             analysis.start()
@@ -343,7 +394,7 @@ def cmd_run(bv):
         return
 
     # Sanitize options
-    tests = test_groups[gui_tests.result]
+    tests_name = test_groups[gui_tests.result]
     rename_only_unknowns = gui_selector.choices[gui_selector.result] == 'sub_.*'
     add_comment = gui_comment.choices[gui_comment.result] == 'Yes'
     prefix = gui_prefix.result.strip()
@@ -357,7 +408,7 @@ def cmd_run(bv):
     log_info(f'{len(funks)} functions found', logger=logger)
 
     # Do the magic
-    guess(bv, funks, tests, prefix=prefix, add_comment=add_comment, timeout=2, m_arch=m_arch,
+    guess(bv, funks, tests_name, prefix=prefix, add_comment=add_comment, timeout=2, m_arch=m_arch,
           multi=True)
 
 
@@ -383,12 +434,12 @@ def cmd_run_on_function(bv, funk):
     if not ret:
         return
 
-    tests = test_groups[gui_tests.result]
+    tests_name = test_groups[gui_tests.result]
     add_comment = gui_comment.choices[gui_comment.result] == 'Yes'
     prefix = gui_prefix.result.strip()
     m_arch = gui_arch.choices[gui_arch.result]
 
-    guess(bv, [funk], tests, prefix=prefix, add_comment=add_comment, timeout=5, m_arch=m_arch)
+    guess(bv, [funk], tests_name, prefix=prefix, add_comment=add_comment, timeout=3, m_arch=m_arch)
 
 
 PluginCommand.register(
