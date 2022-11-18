@@ -130,8 +130,8 @@ def analyze(tests, bin_file, base_addr, arch, addr, abi, engine, timeout=3, siby
         log_debug(f'base address changed to {base_addr:#x} (offset={ofs:+#x})', logger=logger)
         addr = addr + ofs
 
-    _cmd = f'{get_timeout_command()} {timeout+1} {get_sibyl_command()} find -o JSON'
-    opts = f' -a {arch} -b {abi} -t {tests} -i {timeout} -m {base_addr} -j {engine}'
+    _cmd = f'{get_timeout_command()} {timeout} {get_sibyl_command()} find -o JSON'
+    opts = f' -a {arch} -b {abi} -t {tests} -i {sibyl_timeout} -m {base_addr} -j {engine}'
     cmd = f'{_cmd}{opts} {bin_file} {addr}'
     r = exec_cmd(cmd)
 
